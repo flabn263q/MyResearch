@@ -4,7 +4,6 @@ matplotlib.use('Agg')
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import torch
@@ -17,8 +16,13 @@ from collections import deque, namedtuple
 import copy
 import time
 import os
-from tqdm import tqdm
 
+# 防呆機制
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterator, *args, **kwargs):
+        return iterator
 
 # ==========================================
 # 1. Configuration
@@ -26,7 +30,7 @@ from tqdm import tqdm
 class Config:
     # --- Experiment Settings ---
     TRAIN_STEPS = 50000    
-    EVAL_INTERVAL = 1000 
+    EVAL_INTERVAL = 1000   
     SEED = 42
     
     # --- Environment Dimensions ---
@@ -52,9 +56,10 @@ class Config:
     
     Q_LIMIT = 2            
     
-    # --- Reward Weights ---
+    # --- Reward Weights & Scaling ---
     W_TARDINESS = 1.0
     W_MAINT_COST = 0.5
+    REWARD_SCALE = 100.0  # [修正 4] 獎勵縮放因子
     
     # --- Normalization Factors ---
     NORM_Q_LEN = 10.0
@@ -71,6 +76,14 @@ class Config:
     EPSILON_DECAY = 10000 
     TARGET_UPDATE = 200
     HIDDEN_DIM = 128
+
+def set_seed(seed):
+    """[修正 2] 設定全域隨機種子"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # ==========================================
 # 2. Core Classes
@@ -134,11 +147,8 @@ class AdvancedDFJSPEnv(gym.Env):
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.state_dim,), dtype=np.float32)
         
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            
+        # 注意：這裡的 seed 參數主要給 Gym 用，我們主要依賴全域 set_seed
+        
         self.machines = [Machine(i) for i in range(Config.NUM_MACHINES)]
         self.job_buffer = []     
         self.active_jobs = []    
@@ -197,12 +207,12 @@ class AdvancedDFJSPEnv(gym.Env):
                 m_id, j_id = data
                 machine = self.machines[m_id]
                 
-                # Lazy Update: 檢查工件是否因故障被推遲
+                # Lazy Update
                 if self.now < machine.current_job_finish_time:
                     heapq.heappush(self.event_queue, (machine.current_job_finish_time, 'JOB_FINISH', data))
                     continue
 
-                # [視覺化修正] 更新歷史紀錄中的結束時間
+                # 更新歷史紀錄中的結束時間 (視覺化修正)
                 for i in range(len(machine.history) - 1, -1, -1):
                     entry = machine.history[i]
                     if entry[0] == j_id and entry[4] == 'JOB':
@@ -242,7 +252,7 @@ class AdvancedDFJSPEnv(gym.Env):
                 machine = self.machines[m_id]
                 self.avail_crews += 1
                 
-                # [邏輯修正] 檢查機器是否還有未完成的工件
+                # 檢查機器是否還有未完成的工件
                 if self.now < machine.current_job_finish_time:
                     machine.status = 1 # Busy
                 else:
@@ -267,7 +277,6 @@ class AdvancedDFJSPEnv(gym.Env):
         else:
             machine.status = 3 # Waiting
             self.repair_queue.append((machine.id, m_type, duration, was_busy, self.now))
-            # 這裡不寫 history，等真正開始修再寫 WAIT
 
     def _start_maintenance(self, machine, m_type, duration, was_busy, wait_time):
         self.avail_crews -= 1
@@ -302,11 +311,12 @@ class AdvancedDFJSPEnv(gym.Env):
             reward += self.accumulated_reward
             self.accumulated_reward = 0.0
             
-            return self._get_state(), reward, False, False, {}
+            # [修正 4] 獎勵縮放
+            return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
         
         if not self.job_buffer:
             self.decision_machine_id = self._resume_simulation()
-            return self._get_state(), reward, False, False, {}
+            return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
             
         selected_job = self._apply_rule(rule_idx, self.job_buffer)
         self.job_buffer.remove(selected_job) 
@@ -327,7 +337,8 @@ class AdvancedDFJSPEnv(gym.Env):
         reward += self.accumulated_reward
         self.accumulated_reward = 0.0
         
-        return self._get_state(), reward, False, False, {}
+        # [修正 4] 獎勵縮放
+        return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
 
     def _apply_rule(self, rule_idx, jobs):
         if rule_idx == 0: return min(jobs, key=lambda j: j.arrival_time)
@@ -411,8 +422,18 @@ class DQNAgent:
         next_state = torch.FloatTensor(np.array(next_state))
         done = torch.FloatTensor(done).unsqueeze(1)
         
+        # [修正 1] 處理 next_mask
+        next_mask = torch.FloatTensor(np.array(next_mask))
+        
         q_val = self.policy_net(state).gather(1, action)
-        next_q = self.target_net(next_state).max(1)[0].unsqueeze(1)
+        
+        # [修正 1] Target Q Masking
+        with torch.no_grad():
+            next_q_values = self.target_net(next_state)
+            inf_mask = (next_mask - 1) * 1e9
+            masked_next_q = next_q_values + inf_mask
+            next_q = masked_next_q.max(1)[0].unsqueeze(1)
+            
         expected_q = reward + Config.GAMMA * next_q * (1 - done)
         
         loss = nn.MSELoss()(q_val, expected_q)
@@ -424,6 +445,9 @@ class DQNAgent:
 # 5. Main Execution
 # ==========================================
 def run_advanced_experiment():
+    # [修正 2] 設定全域種子
+    set_seed(Config.SEED)
+    
     print("Starting Advanced Integrated Scheduling (Sim-to-Real)...")
     env = AdvancedDFJSPEnv()
     agent = DQNAgent(env.observation_space.shape[0], env.action_space.n)
@@ -503,7 +527,7 @@ def run_advanced_experiment():
     plt.savefig("advanced_gantt.png")
     print("Saved advanced_gantt.png")
     
-    # [新增] 保存模型
+    # Save the trained model
     torch.save(agent.policy_net.state_dict(), "advanced_dqn_model.pth")
     print("Model saved as advanced_dqn_model.pth")
 
