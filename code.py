@@ -12,10 +12,7 @@ import torch.optim as optim
 import random
 import math
 import heapq
-from collections import deque, namedtuple
-import copy
-import time
-import os
+from collections import deque
 
 # 防呆機制
 try:
@@ -65,6 +62,7 @@ class Config:
     NORM_Q_LEN = 10.0
     NORM_TARDINESS = 50.0
     NORM_PROC_TIME = 20.0
+    NORM_AGE_ACCUM = 30.0 # [修正 2] 新增疲勞度正規化因子
     
     # --- RL Hyperparameters ---
     LR = 1e-4
@@ -76,7 +74,7 @@ class Config:
     EPSILON_DECAY = 10000 
     TARGET_UPDATE = 200
     HIDDEN_DIM = 128
-    GRAD_CLIP = 10.0  # [修正 2] 梯度裁剪閾值
+    GRAD_CLIP = 10.0
 
 def set_seed(seed):
     random.seed(seed)
@@ -344,7 +342,8 @@ class AdvancedDFJSPEnv(gym.Env):
             m_feats.extend([
                 m.state / Config.K_STATES,     
                 1.0 if m.status == 1 else 0.0, 
-                0.0 
+                # [修正 2] 啟用有效特徵：累積疲勞度
+                np.tanh(m.age_accum / Config.NORM_AGE_ACCUM)
             ])
             
         if self.job_buffer:
@@ -379,7 +378,6 @@ class DQN(nn.Module):
 
 class DQNAgent:
     def __init__(self, state_dim, action_dim):
-        # [修正 3] 自動偵測裝置
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         self.policy_net = DQN(state_dim, action_dim).to(self.device)
@@ -400,7 +398,6 @@ class DQNAgent:
             return random.choice(valid_indices)
         
         with torch.no_grad():
-            # [修正 3] 確保 Tensor 在正確的 Device
             state_t = torch.FloatTensor(state).to(self.device)
             mask_t = torch.FloatTensor(mask).to(self.device)
             
@@ -414,7 +411,6 @@ class DQNAgent:
         batch = random.sample(self.memory, Config.BATCH_SIZE)
         state, action, reward, next_state, done, mask, next_mask = zip(*batch)
         
-        # [修正 3] 確保所有 Batch Tensor 都在正確的 Device
         state = torch.FloatTensor(np.array(state)).to(self.device)
         action = torch.LongTensor(action).unsqueeze(1).to(self.device)
         reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
@@ -436,7 +432,6 @@ class DQNAgent:
         self.optimizer.zero_grad()
         loss.backward()
         
-        # [修正 2] 梯度裁剪
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), Config.GRAD_CLIP)
         
         self.optimizer.step()
