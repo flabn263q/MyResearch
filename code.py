@@ -163,7 +163,6 @@ class AdvancedDFJSPEnv(gym.Env):
         # 快轉到第一個決策點
         self.decision_machine_id = self._resume_simulation()
         
-        # 清除熱身階段的罰分
         self.accumulated_reward = 0.0
         return self._get_state(), {}
 
@@ -202,10 +201,21 @@ class AdvancedDFJSPEnv(gym.Env):
                 m_id, j_id = data
                 machine = self.machines[m_id]
                 
-                # Lazy Update: 檢查工件是否因故障被推遲
+                # Lazy Update
                 if self.now < machine.current_job_finish_time:
                     heapq.heappush(self.event_queue, (machine.current_job_finish_time, 'JOB_FINISH', data))
                     continue
+
+                # [視覺化修正] 更新歷史紀錄中的結束時間
+                # 找到該機器歷史中對應此工件的紀錄，更新其 end_time 為當前真實時間
+                # 倒序搜尋，因為剛完成的工件通常在最後
+                for i in range(len(machine.history) - 1, -1, -1):
+                    entry = machine.history[i]
+                    # entry: (job_id, op_idx, start, end, type)
+                    if entry[0] == j_id and entry[4] == 'JOB':
+                        # Tuple 是不可變的，需替換
+                        machine.history[i] = (entry[0], entry[1], entry[2], self.now, entry[4])
+                        break
 
                 job = next((j for j in self.active_jobs if j.id == j_id), None)
                 
@@ -240,18 +250,16 @@ class AdvancedDFJSPEnv(gym.Env):
                 machine = self.machines[m_id]
                 self.avail_crews += 1
                 
-                # 檢查機器是否還有未完成的工件 (被隨機故障打斷)
                 if self.now < machine.current_job_finish_time:
-                    machine.status = 1 # 繼續忙碌 (Busy)
+                    machine.status = 1 # Busy
                 else:
-                    machine.status = 0 # 真的沒事做了 (Idle)
+                    machine.status = 0 # Idle
                 
                 if m_type == 'PM' or m_type == 'CM':
                     machine.repair_perfect()
                 elif m_type == 'MINIMAL':
                     machine.repair_minimal()
                 
-                # [修正 3] 從隊列取出並計算等待時間
                 if self.repair_queue:
                     next_m_id, next_type, next_dur, next_busy, request_time = self.repair_queue.popleft()
                     wait_time = self.now - request_time
@@ -259,7 +267,6 @@ class AdvancedDFJSPEnv(gym.Env):
                                           was_busy=next_busy, wait_time=wait_time)
 
     def _request_maintenance(self, machine, m_type, duration):
-        # [修正 1] 記錄 was_busy 與 request_time
         was_busy = (machine.status == 1)
         
         if self.avail_crews > 0:
@@ -270,10 +277,8 @@ class AdvancedDFJSPEnv(gym.Env):
             # 這裡不寫 history，等真正開始修再寫 WAIT
 
     def _start_maintenance(self, machine, m_type, duration, was_busy, wait_time):
-        # [修正 2] 核心修正：補償等待時間
         self.avail_crews -= 1
         
-        # 如果機器原本在忙，或者在壞掉前是忙的
         if machine.status == 1 or was_busy:
             total_delay = duration + wait_time
             machine.current_job_finish_time += total_delay
@@ -282,10 +287,8 @@ class AdvancedDFJSPEnv(gym.Env):
         finish_time = self.now + duration
         heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (machine.id, m_type)))
         
-        # 記錄維修
         machine.history.append((-1, -1, self.now, finish_time, m_type))
         
-        # 記錄等待 (視覺化用)
         if wait_time > 0:
             machine.history.append((-1, -1, self.now - wait_time, self.now, 'WAIT'))
 
@@ -298,9 +301,7 @@ class AdvancedDFJSPEnv(gym.Env):
         reward = self.accumulated_reward
         self.accumulated_reward = 0.0
         
-        # 1. 執行維護決策 (PM)
         if do_pm:
-            # [修正 4] 呼叫時傳入 was_busy 與 wait_time=0
             self._start_maintenance(machine, 'PM', Config.TIME_PM, was_busy=(machine.status==1), wait_time=0)
             reward -= Config.W_MAINT_COST
             
@@ -310,7 +311,6 @@ class AdvancedDFJSPEnv(gym.Env):
             
             return self._get_state(), reward, False, False, {}
         
-        # 2. 執行派工決策
         if not self.job_buffer:
             self.decision_machine_id = self._resume_simulation()
             return self._get_state(), reward, False, False, {}
