@@ -12,7 +12,7 @@ import torch.optim as optim
 import random
 import math
 import heapq
-from collections import deque, namedtuple
+from collections import deque
 import os
 
 # 防呆機制
@@ -52,10 +52,10 @@ class Config:
     TIME_CM = 30           
     TIME_MINIMAL = 5       
     
-    MAX_CREWS = 2          # [修正 1] 改名，避免誤解為 Queue Limit
+    MAX_CREWS = 2          
     
     # --- Action Definition ---
-    ACTION_PM = 4          # [修正 3] 定義 PM 動作索引，避免 Magic Number
+    ACTION_PM = 4          
     
     # --- Reward Weights & Scaling ---
     W_TARDINESS = 1.0
@@ -80,6 +80,9 @@ class Config:
     TARGET_UPDATE = 200
     HIDDEN_DIM = 128
     GRAD_CLIP = 10.0
+    
+    # --- Memory Management ---
+    MAX_HISTORY_LEN = 1000 # [修正 3] 歷史紀錄保留長度
 
 def set_seed(seed):
     random.seed(seed)
@@ -89,25 +92,49 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 # ==========================================
-# 2. Efficient Replay Buffer
+# 2. Efficient Replay Buffer [修正 2]
 # ==========================================
 class ReplayBuffer:
-    def __init__(self, capacity):
+    def __init__(self, capacity, state_dim):
         self.capacity = capacity
-        self.buffer = []
-        self.position = 0
-    
+        self.ptr = 0
+        self.size = 0
+        
+        # 預先分配記憶體 (Numpy Arrays)
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity, 1), dtype=np.int64)
+        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity, 1), dtype=np.float32)
+        self.masks = np.zeros((capacity, 5), dtype=np.float32)      # Action Space = 5
+        self.next_masks = np.zeros((capacity, 5), dtype=np.float32)
+
     def push(self, state, action, reward, next_state, done, mask, next_mask):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done, mask, next_mask)
-        self.position = (self.position + 1) % self.capacity
-    
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_states[self.ptr] = next_state
+        self.dones[self.ptr] = done
+        self.masks[self.ptr] = mask
+        self.next_masks[self.ptr] = next_mask
+        
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
     def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
-    
+        ind = np.random.randint(0, self.size, size=batch_size)
+        return (
+            self.states[ind],
+            self.actions[ind],
+            self.rewards[ind],
+            self.next_states[ind],
+            self.dones[ind],
+            self.masks[ind],
+            self.next_masks[ind]
+        )
+
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
 # ==========================================
 # 3. Core Classes
@@ -157,6 +184,12 @@ class Machine:
         
     def repair_minimal(self):
         pass
+    
+    def clean_history(self, current_time):
+        # [修正 3] 清理過舊的歷史紀錄，防止記憶體洩漏
+        # 只保留最近一段時間的紀錄供畫圖
+        cutoff = current_time - 500 # 保留最近 500 單位時間
+        self.history = [h for h in self.history if h[3] > cutoff]
 
 # ==========================================
 # 4. Advanced Event-Driven Environment
@@ -165,11 +198,7 @@ class AdvancedDFJSPEnv(gym.Env):
     def __init__(self):
         super(AdvancedDFJSPEnv, self).__init__()
         
-        # Action Space: 5 Discrete Actions
-        # 0-3: Dispatch Rules
-        # 4: Perform PM (Config.ACTION_PM)
         self.action_space = spaces.Discrete(5)
-        
         self.state_dim = (3 * Config.NUM_MACHINES) + 3 + 1
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.state_dim,), dtype=np.float32)
         
@@ -181,7 +210,7 @@ class AdvancedDFJSPEnv(gym.Env):
         
         self.now = 0.0
         self.event_queue = []    
-        self.avail_crews = Config.MAX_CREWS # [修正 1] 使用正確變數名
+        self.avail_crews = Config.MAX_CREWS
         self.job_counter = 0
         
         self.accumulated_reward = 0.0
@@ -317,7 +346,6 @@ class AdvancedDFJSPEnv(gym.Env):
     def step(self, action):
         machine = self.machines[self.decision_machine_id]
         
-        # [修正 3] 使用 Config.ACTION_PM
         is_pm = (action == Config.ACTION_PM)
         rule_idx = action if not is_pm else 0
         
@@ -338,7 +366,10 @@ class AdvancedDFJSPEnv(gym.Env):
             
             return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
         
-        # [修正 2] 移除死代碼 (if not self.job_buffer)
+        # [修正 4] 防禦性檢查：如果 Buffer 空了 (理論上不會發生)，強制跳過
+        if not self.job_buffer:
+            self.decision_machine_id = self._resume_simulation()
+            return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
             
         selected_job = self._apply_rule(rule_idx, self.job_buffer)
         self.job_buffer.remove(selected_job) 
@@ -371,9 +402,14 @@ class AdvancedDFJSPEnv(gym.Env):
     def _get_state(self):
         m_feats = []
         for m in self.machines:
+            # [修正 1] 狀態特徵明確化
+            status_val = 0.0 # Idle
+            if m.status == 1: status_val = 1.0 # Busy
+            elif m.status >= 2: status_val = -1.0 # Down/Wait
+            
             m_feats.extend([
                 m.state / Config.K_STATES,     
-                1.0 if m.status == 1 else 0.0, 
+                status_val, 
                 np.tanh(m.age_accum / Config.NORM_AGE_ACCUM)
             ])
             
@@ -384,15 +420,24 @@ class AdvancedDFJSPEnv(gym.Env):
         else:
             q_len, avg_tard, avg_proc = 0, 0, 0
             
-        crew_ratio = self.avail_crews / Config.MAX_CREWS # [修正 1]
+        crew_ratio = self.avail_crews / Config.MAX_CREWS
         
         state = np.array(m_feats + [q_len, avg_tard, avg_proc, crew_ratio], dtype=np.float32)
         
         mask = np.ones(5, dtype=np.float32)
         if self.avail_crews <= 0:
-            mask[Config.ACTION_PM] = 0.0 # [修正 3]
+            mask[Config.ACTION_PM] = 0.0 
+        
+        # [修正 4] 如果 Buffer 空了，封鎖所有派工動作 (0-3)
+        if not self.job_buffer:
+            mask[0:4] = 0.0
             
         return state, mask
+
+    def clean_history(self):
+        # [修正 3] 清理歷史紀錄
+        for m in self.machines:
+            m.clean_history(self.now)
 
 # ==========================================
 # 4. Agent & Training
@@ -415,7 +460,10 @@ class DQNAgent:
         self.target_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=Config.LR)
-        self.memory = ReplayBuffer(Config.BUFFER_SIZE)
+        
+        # [修正 2] 使用高效 Buffer
+        self.memory = ReplayBuffer(Config.BUFFER_SIZE, state_dim)
+        
         self.steps = 0
         self.action_dim = action_dim
         
@@ -426,6 +474,7 @@ class DQNAgent:
         
         if training and random.random() < eps:
             valid_indices = [i for i, m in enumerate(mask) if m == 1.0]
+            if not valid_indices: return 0 # Fallback
             return random.choice(valid_indices)
         
         with torch.no_grad():
@@ -439,15 +488,16 @@ class DQNAgent:
 
     def update(self):
         if len(self.memory) < Config.BATCH_SIZE: return
-        batch = self.memory.sample(Config.BATCH_SIZE)
-        state, action, reward, next_state, done, mask, next_mask = zip(*batch)
         
-        state = torch.FloatTensor(np.array(state)).to(self.device)
-        action = torch.LongTensor(action).unsqueeze(1).to(self.device)
-        reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
-        next_state = torch.FloatTensor(np.array(next_state)).to(self.device)
-        done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
-        next_mask = torch.FloatTensor(np.array(next_mask)).to(self.device)
+        # [修正 2] 高效採樣
+        states, actions, rewards, next_states, dones, masks, next_masks = self.memory.sample(Config.BATCH_SIZE)
+        
+        state = torch.FloatTensor(states).to(self.device)
+        action = torch.LongTensor(actions).to(self.device)
+        reward = torch.FloatTensor(rewards).to(self.device)
+        next_state = torch.FloatTensor(next_states).to(self.device)
+        done = torch.FloatTensor(dones).to(self.device)
+        next_mask = torch.FloatTensor(next_masks).to(self.device)
         
         q_val = self.policy_net(state).gather(1, action)
         
@@ -499,6 +549,9 @@ def run_advanced_experiment():
             agent.target_net.load_state_dict(agent.policy_net.state_dict())
             
         if step % Config.EVAL_INTERVAL == 0:
+            # [修正 3] 定期清理記憶體
+            env.clean_history()
+            
             if env.finished_jobs:
                 avg_t = np.mean([j.get_tardiness(j.completion_time) for j in env.finished_jobs[-50:]])
                 avg_tardiness.append(avg_t)
