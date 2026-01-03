@@ -41,7 +41,7 @@ class Config:
     
     # --- Machine Deterioration ---
     K_STATES = 5           
-    STATE_DEGRADE_PROB = 0.2 
+    STATE_DEGRADE_PROB = 0.1 # [調整] 降低機率，配合 age_accum 重置邏輯
     PROC_TIME_PENALTY = 0.1  
     
     # --- Dual Failure Modes ---
@@ -58,9 +58,9 @@ class Config:
     ACTION_PM = 4          
     
     # --- Reward Weights & Scaling ---
-    W_TARDINESS = 1.0
+    # [修正 4] 移除 W_TARDINESS (Completion)，只保留 Step Penalty
     W_MAINT_COST = 0.5
-    W_STEP_PENALTY = 0.1
+    W_STEP_PENALTY = 1.0  # 強化過程懲罰
     REWARD_SCALE = 10.0
     
     # --- Normalization Factors ---
@@ -68,6 +68,8 @@ class Config:
     NORM_TARDINESS = 50.0
     NORM_PROC_TIME = 20.0
     NORM_AGE_ACCUM = 50.0 
+    NORM_REMAIN_TIME = 20.0 # [新增]
+    NORM_FAIL_COUNT = 5.0   # [新增]
     
     # --- RL Hyperparameters ---
     LR = 1e-4
@@ -82,7 +84,7 @@ class Config:
     GRAD_CLIP = 10.0
     
     # --- Memory Management ---
-    MAX_HISTORY_LEN = 1000 # [修正 3] 歷史紀錄保留長度
+    MAX_HISTORY_LEN = 1000 
 
 def set_seed(seed):
     random.seed(seed)
@@ -92,7 +94,7 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 # ==========================================
-# 2. Efficient Replay Buffer [修正 2]
+# 2. Efficient Replay Buffer
 # ==========================================
 class ReplayBuffer:
     def __init__(self, capacity, state_dim):
@@ -100,13 +102,12 @@ class ReplayBuffer:
         self.ptr = 0
         self.size = 0
         
-        # 預先分配記憶體 (Numpy Arrays)
         self.states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.actions = np.zeros((capacity, 1), dtype=np.int64)
         self.rewards = np.zeros((capacity, 1), dtype=np.float32)
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.dones = np.zeros((capacity, 1), dtype=np.float32)
-        self.masks = np.zeros((capacity, 5), dtype=np.float32)      # Action Space = 5
+        self.masks = np.zeros((capacity, 5), dtype=np.float32)
         self.next_masks = np.zeros((capacity, 5), dtype=np.float32)
 
     def push(self, state, action, reward, next_state, done, mask, next_mask):
@@ -167,28 +168,30 @@ class Machine:
         self.status = 0      # 0: Idle, 1: Busy, 2: Down/Maint, 3: Waiting
         self.age_accum = 0.0 
         self.history = []    
-        self.current_job_finish_time = 0.0 
+        self.finish_time = 0.0 # [修正 1] 統一管理釋放時間
+        self.failure_count = 0 # [修正 1] 故障計數
 
     def get_actual_proc_time(self, base_time):
         return base_time * (1.0 + self.state * Config.PROC_TIME_PENALTY)
 
     def degrade(self):
-        prob = Config.STATE_DEGRADE_PROB + (self.age_accum * 0.01)
+        # [修正 1] 物理校準：機率隨「當前狀態累積時間」增加
+        prob = Config.STATE_DEGRADE_PROB + (self.age_accum * 0.005)
         if random.random() < prob and self.state < Config.K_STATES:
             self.state += 1
+            self.age_accum = 0 # [修正 1] 狀態改變，累積歸零
         return self.state >= Config.K_STATES 
 
     def repair_perfect(self):
         self.state = 0
         self.age_accum = 0
+        self.failure_count = 0 # PM 後故障計數歸零 (可選)
         
     def repair_minimal(self):
-        pass
+        self.failure_count += 1 # [修正 1] 增加故障計數
     
     def clean_history(self, current_time):
-        # [修正 3] 清理過舊的歷史紀錄，防止記憶體洩漏
-        # 只保留最近一段時間的紀錄供畫圖
-        cutoff = current_time - 500 # 保留最近 500 單位時間
+        cutoff = current_time - 500 
         self.history = [h for h in self.history if h[3] > cutoff]
 
 # ==========================================
@@ -199,7 +202,10 @@ class AdvancedDFJSPEnv(gym.Env):
         super(AdvancedDFJSPEnv, self).__init__()
         
         self.action_space = spaces.Discrete(5)
-        self.state_dim = (3 * Config.NUM_MACHINES) + 3 + 1
+        
+        # [修正 1] State Dim: (7 * M) + 3 + 1
+        # Machine: [State, Idle, Busy, Down, Age, Remain, FailCount]
+        self.state_dim = (7 * Config.NUM_MACHINES) + 3 + 1
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.state_dim,), dtype=np.float32)
         
     def reset(self, seed=None, options=None):
@@ -213,7 +219,6 @@ class AdvancedDFJSPEnv(gym.Env):
         self.avail_crews = Config.MAX_CREWS
         self.job_counter = 0
         
-        self.accumulated_reward = 0.0
         self.repair_queue = deque() 
         
         self._schedule_next_arrival()
@@ -221,7 +226,6 @@ class AdvancedDFJSPEnv(gym.Env):
         
         self.decision_machine_id = self._resume_simulation()
         
-        self.accumulated_reward = 0.0
         return self._get_state(), {}
 
     def _schedule_next_arrival(self):
@@ -259,8 +263,8 @@ class AdvancedDFJSPEnv(gym.Env):
                 m_id, j_id = data
                 machine = self.machines[m_id]
                 
-                if self.now < machine.current_job_finish_time:
-                    heapq.heappush(self.event_queue, (machine.current_job_finish_time, 'JOB_FINISH', data))
+                if self.now < machine.finish_time:
+                    heapq.heappush(self.event_queue, (machine.finish_time, 'JOB_FINISH', data))
                     continue
 
                 for i in range(len(machine.history) - 1, -1, -1):
@@ -278,9 +282,7 @@ class AdvancedDFJSPEnv(gym.Env):
                         job.completion_time = self.now
                         self.active_jobs.remove(job)
                         self.finished_jobs.append(job)
-                        
-                        tardiness = job.get_tardiness(self.now)
-                        self.accumulated_reward -= Config.W_TARDINESS * tardiness
+                        # [修正 4] 移除這裡的 Tardiness 扣分，避免雙重計算
                     else:
                         self.job_buffer.append(job)
                 
@@ -302,7 +304,7 @@ class AdvancedDFJSPEnv(gym.Env):
                 machine = self.machines[m_id]
                 self.avail_crews += 1
                 
-                if self.now < machine.current_job_finish_time:
+                if self.now < machine.finish_time:
                     machine.status = 1 
                 else:
                     machine.status = 0 
@@ -332,7 +334,7 @@ class AdvancedDFJSPEnv(gym.Env):
         
         if machine.status == 1 or was_busy:
             total_delay = duration + wait_time
-            machine.current_job_finish_time += total_delay
+            machine.finish_time += total_delay
         
         machine.status = 2 
         finish_time = self.now + duration
@@ -349,9 +351,9 @@ class AdvancedDFJSPEnv(gym.Env):
         is_pm = (action == Config.ACTION_PM)
         rule_idx = action if not is_pm else 0
         
-        reward = self.accumulated_reward
-        self.accumulated_reward = 0.0
+        reward = 0.0
         
+        # [修正 4] 稠密獎勵 (Dense Reward)
         if self.active_jobs:
             current_avg_tardiness = np.mean([j.get_tardiness(self.now) for j in self.active_jobs])
             reward -= Config.W_STEP_PENALTY * current_avg_tardiness
@@ -361,12 +363,8 @@ class AdvancedDFJSPEnv(gym.Env):
             reward -= Config.W_MAINT_COST
             
             self.decision_machine_id = self._resume_simulation()
-            reward += self.accumulated_reward
-            self.accumulated_reward = 0.0
-            
             return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
         
-        # [修正 4] 防禦性檢查：如果 Buffer 空了 (理論上不會發生)，強制跳過
         if not self.job_buffer:
             self.decision_machine_id = self._resume_simulation()
             return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
@@ -380,15 +378,12 @@ class AdvancedDFJSPEnv(gym.Env):
         machine.status = 1 
         machine.age_accum += actual_time
         finish_time = self.now + actual_time
-        machine.current_job_finish_time = finish_time 
+        machine.finish_time = finish_time 
         
         machine.history.append((selected_job.id, selected_job.current_op_idx, self.now, finish_time, 'JOB'))
         heapq.heappush(self.event_queue, (finish_time, 'JOB_FINISH', (machine.id, selected_job.id)))
         
         self.decision_machine_id = self._resume_simulation()
-        
-        reward += self.accumulated_reward
-        self.accumulated_reward = 0.0
         
         return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
 
@@ -402,15 +397,20 @@ class AdvancedDFJSPEnv(gym.Env):
     def _get_state(self):
         m_feats = []
         for m in self.machines:
-            # [修正 1] 狀態特徵明確化
-            status_val = 0.0 # Idle
-            if m.status == 1: status_val = 1.0 # Busy
-            elif m.status >= 2: status_val = -1.0 # Down/Wait
+            # [修正 2] One-Hot Encoding
+            is_idle = 1.0 if m.status == 0 else 0.0
+            is_busy = 1.0 if m.status == 1 else 0.0
+            is_down = 1.0 if m.status >= 2 else 0.0
+            
+            # [修正 1] 新增 Remaining Time 與 Failure Count
+            remain_time = max(0, m.finish_time - self.now)
             
             m_feats.extend([
                 m.state / Config.K_STATES,     
-                status_val, 
-                np.tanh(m.age_accum / Config.NORM_AGE_ACCUM)
+                is_idle, is_busy, is_down,
+                np.tanh(m.age_accum / Config.NORM_AGE_ACCUM),
+                np.tanh(remain_time / Config.NORM_REMAIN_TIME),
+                np.tanh(m.failure_count / Config.NORM_FAIL_COUNT)
             ])
             
         if self.job_buffer:
@@ -428,16 +428,18 @@ class AdvancedDFJSPEnv(gym.Env):
         if self.avail_crews <= 0:
             mask[Config.ACTION_PM] = 0.0 
         
-        # [修正 4] 如果 Buffer 空了，封鎖所有派工動作 (0-3)
         if not self.job_buffer:
             mask[0:4] = 0.0
             
         return state, mask
 
     def clean_history(self):
-        # [修正 3] 清理歷史紀錄
         for m in self.machines:
             m.clean_history(self.now)
+        
+        # [修正 3] 清理 finished_jobs
+        if len(self.finished_jobs) > 1000:
+            self.finished_jobs = self.finished_jobs[-1000:]
 
 # ==========================================
 # 4. Agent & Training
@@ -460,10 +462,7 @@ class DQNAgent:
         self.target_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=Config.LR)
-        
-        # [修正 2] 使用高效 Buffer
         self.memory = ReplayBuffer(Config.BUFFER_SIZE, state_dim)
-        
         self.steps = 0
         self.action_dim = action_dim
         
@@ -474,7 +473,7 @@ class DQNAgent:
         
         if training and random.random() < eps:
             valid_indices = [i for i, m in enumerate(mask) if m == 1.0]
-            if not valid_indices: return 0 # Fallback
+            if not valid_indices: return 0 
             return random.choice(valid_indices)
         
         with torch.no_grad():
@@ -489,7 +488,6 @@ class DQNAgent:
     def update(self):
         if len(self.memory) < Config.BATCH_SIZE: return
         
-        # [修正 2] 高效採樣
         states, actions, rewards, next_states, dones, masks, next_masks = self.memory.sample(Config.BATCH_SIZE)
         
         state = torch.FloatTensor(states).to(self.device)
@@ -549,7 +547,6 @@ def run_advanced_experiment():
             agent.target_net.load_state_dict(agent.policy_net.state_dict())
             
         if step % Config.EVAL_INTERVAL == 0:
-            # [修正 3] 定期清理記憶體
             env.clean_history()
             
             if env.finished_jobs:
