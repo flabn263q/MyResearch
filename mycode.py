@@ -39,9 +39,10 @@ class Config:
     ARRIVAL_RATE = 0.15    
     DUE_DATE_FACTOR = 1.5  
     
-    # --- Machine Deterioration ---
+    # --- Machine Deterioration (Calibrated) ---
     K_STATES = 5           
-    STATE_DEGRADE_PROB = 0.1 # [調整] 降低機率，配合 age_accum 重置邏輯
+    STATE_DEGRADE_PROB = 0.01  # [修正 3] 降低基礎老化機率
+    AGE_DEGRADE_COEFF = 0.001  # [修正 3] 降低疲勞老化係數
     PROC_TIME_PENALTY = 0.1  
     
     # --- Dual Failure Modes ---
@@ -58,18 +59,17 @@ class Config:
     ACTION_PM = 4          
     
     # --- Reward Weights & Scaling ---
-    # [修正 4] 移除 W_TARDINESS (Completion)，只保留 Step Penalty
     W_MAINT_COST = 0.5
-    W_STEP_PENALTY = 1.0  # 強化過程懲罰
-    REWARD_SCALE = 10.0
+    W_STEP_PENALTY = 1.0  
+    REWARD_SCALE = 100.0       # [修正 2] 因應 Sum Reward 數值變大，調大縮放因子
     
     # --- Normalization Factors ---
     NORM_Q_LEN = 10.0
     NORM_TARDINESS = 50.0
     NORM_PROC_TIME = 20.0
     NORM_AGE_ACCUM = 50.0 
-    NORM_REMAIN_TIME = 20.0 # [新增]
-    NORM_FAIL_COUNT = 5.0   # [新增]
+    NORM_REMAIN_TIME = 20.0
+    NORM_FAIL_COUNT = 5.0
     
     # --- RL Hyperparameters ---
     LR = 1e-4
@@ -168,27 +168,27 @@ class Machine:
         self.status = 0      # 0: Idle, 1: Busy, 2: Down/Maint, 3: Waiting
         self.age_accum = 0.0 
         self.history = []    
-        self.finish_time = 0.0 # [修正 1] 統一管理釋放時間
-        self.failure_count = 0 # [修正 1] 故障計數
+        self.current_job_finish_time = 0.0 
+        self.failure_count = 0 
 
     def get_actual_proc_time(self, base_time):
         return base_time * (1.0 + self.state * Config.PROC_TIME_PENALTY)
 
     def degrade(self):
-        # [修正 1] 物理校準：機率隨「當前狀態累積時間」增加
-        prob = Config.STATE_DEGRADE_PROB + (self.age_accum * 0.005)
+        # [修正 3] 物理模型校準
+        prob = Config.STATE_DEGRADE_PROB + (self.age_accum * Config.AGE_DEGRADE_COEFF)
         if random.random() < prob and self.state < Config.K_STATES:
             self.state += 1
-            self.age_accum = 0 # [修正 1] 狀態改變，累積歸零
+            self.age_accum = 0 
         return self.state >= Config.K_STATES 
 
     def repair_perfect(self):
         self.state = 0
         self.age_accum = 0
-        self.failure_count = 0 # PM 後故障計數歸零 (可選)
+        self.failure_count = 0 
         
     def repair_minimal(self):
-        self.failure_count += 1 # [修正 1] 增加故障計數
+        self.failure_count += 1 
     
     def clean_history(self, current_time):
         cutoff = current_time - 500 
@@ -203,8 +203,7 @@ class AdvancedDFJSPEnv(gym.Env):
         
         self.action_space = spaces.Discrete(5)
         
-        # [修正 1] State Dim: (7 * M) + 3 + 1
-        # Machine: [State, Idle, Busy, Down, Age, Remain, FailCount]
+        # State Dim: (7 * M) + 3 + 1
         self.state_dim = (7 * Config.NUM_MACHINES) + 3 + 1
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.state_dim,), dtype=np.float32)
         
@@ -219,6 +218,7 @@ class AdvancedDFJSPEnv(gym.Env):
         self.avail_crews = Config.MAX_CREWS
         self.job_counter = 0
         
+        self.accumulated_reward = 0.0
         self.repair_queue = deque() 
         
         self._schedule_next_arrival()
@@ -226,6 +226,7 @@ class AdvancedDFJSPEnv(gym.Env):
         
         self.decision_machine_id = self._resume_simulation()
         
+        self.accumulated_reward = 0.0
         return self._get_state(), {}
 
     def _schedule_next_arrival(self):
@@ -263,8 +264,8 @@ class AdvancedDFJSPEnv(gym.Env):
                 m_id, j_id = data
                 machine = self.machines[m_id]
                 
-                if self.now < machine.finish_time:
-                    heapq.heappush(self.event_queue, (machine.finish_time, 'JOB_FINISH', data))
+                if self.now < machine.current_job_finish_time:
+                    heapq.heappush(self.event_queue, (machine.current_job_finish_time, 'JOB_FINISH', data))
                     continue
 
                 for i in range(len(machine.history) - 1, -1, -1):
@@ -282,7 +283,6 @@ class AdvancedDFJSPEnv(gym.Env):
                         job.completion_time = self.now
                         self.active_jobs.remove(job)
                         self.finished_jobs.append(job)
-                        # [修正 4] 移除這裡的 Tardiness 扣分，避免雙重計算
                     else:
                         self.job_buffer.append(job)
                 
@@ -304,7 +304,7 @@ class AdvancedDFJSPEnv(gym.Env):
                 machine = self.machines[m_id]
                 self.avail_crews += 1
                 
-                if self.now < machine.finish_time:
+                if self.now < machine.current_job_finish_time:
                     machine.status = 1 
                 else:
                     machine.status = 0 
@@ -334,7 +334,7 @@ class AdvancedDFJSPEnv(gym.Env):
         
         if machine.status == 1 or was_busy:
             total_delay = duration + wait_time
-            machine.finish_time += total_delay
+            machine.current_job_finish_time += total_delay
         
         machine.status = 2 
         finish_time = self.now + duration
@@ -351,18 +351,22 @@ class AdvancedDFJSPEnv(gym.Env):
         is_pm = (action == Config.ACTION_PM)
         rule_idx = action if not is_pm else 0
         
-        reward = 0.0
+        reward = self.accumulated_reward
+        self.accumulated_reward = 0.0
         
-        # [修正 4] 稠密獎勵 (Dense Reward)
+        # [修正 2] 獎勵計算：Sum over Mean
         if self.active_jobs:
-            current_avg_tardiness = np.mean([j.get_tardiness(self.now) for j in self.active_jobs])
-            reward -= Config.W_STEP_PENALTY * current_avg_tardiness
+            current_total_tardiness = np.sum([j.get_tardiness(self.now) for j in self.active_jobs])
+            reward -= Config.W_STEP_PENALTY * current_total_tardiness
         
         if is_pm:
             self._start_maintenance(machine, 'PM', Config.TIME_PM, was_busy=(machine.status==1), wait_time=0)
             reward -= Config.W_MAINT_COST
             
             self.decision_machine_id = self._resume_simulation()
+            reward += self.accumulated_reward
+            self.accumulated_reward = 0.0
+            
             return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
         
         if not self.job_buffer:
@@ -378,12 +382,15 @@ class AdvancedDFJSPEnv(gym.Env):
         machine.status = 1 
         machine.age_accum += actual_time
         finish_time = self.now + actual_time
-        machine.finish_time = finish_time 
+        machine.current_job_finish_time = finish_time 
         
         machine.history.append((selected_job.id, selected_job.current_op_idx, self.now, finish_time, 'JOB'))
         heapq.heappush(self.event_queue, (finish_time, 'JOB_FINISH', (machine.id, selected_job.id)))
         
         self.decision_machine_id = self._resume_simulation()
+        
+        reward += self.accumulated_reward
+        self.accumulated_reward = 0.0
         
         return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
 
@@ -397,13 +404,11 @@ class AdvancedDFJSPEnv(gym.Env):
     def _get_state(self):
         m_feats = []
         for m in self.machines:
-            # [修正 2] One-Hot Encoding
             is_idle = 1.0 if m.status == 0 else 0.0
             is_busy = 1.0 if m.status == 1 else 0.0
             is_down = 1.0 if m.status >= 2 else 0.0
             
-            # [修正 1] 新增 Remaining Time 與 Failure Count
-            remain_time = max(0, m.finish_time - self.now)
+            remain_time = max(0, m.current_job_finish_time - self.now)
             
             m_feats.extend([
                 m.state / Config.K_STATES,     
@@ -415,8 +420,9 @@ class AdvancedDFJSPEnv(gym.Env):
             
         if self.job_buffer:
             q_len = np.tanh(len(self.job_buffer) / Config.NORM_Q_LEN) 
-            avg_tard = np.tanh(np.mean([j.get_tardiness(self.now) for j in self.job_buffer]) / Config.NORM_TARDINESS)
-            avg_proc = np.tanh(np.mean([j.get_base_proc_time() for j in self.job_buffer]) / Config.NORM_PROC_TIME)
+            # [修正 1] 感知對齊：統計 active_jobs 而非 job_buffer
+            avg_tard = np.tanh(np.mean([j.get_tardiness(self.now) for j in self.active_jobs]) / Config.NORM_TARDINESS)
+            avg_proc = np.tanh(np.mean([j.get_base_proc_time() for j in self.active_jobs]) / Config.NORM_PROC_TIME)
         else:
             q_len, avg_tard, avg_proc = 0, 0, 0
             
@@ -437,7 +443,6 @@ class AdvancedDFJSPEnv(gym.Env):
         for m in self.machines:
             m.clean_history(self.now)
         
-        # [修正 3] 清理 finished_jobs
         if len(self.finished_jobs) > 1000:
             self.finished_jobs = self.finished_jobs[-1000:]
 
