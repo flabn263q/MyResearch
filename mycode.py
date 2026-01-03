@@ -12,7 +12,9 @@ import torch.optim as optim
 import random
 import math
 import heapq
-from collections import deque
+# [修正] 補回 deque
+from collections import deque, namedtuple
+import os
 
 # 防呆機制
 try:
@@ -56,22 +58,23 @@ class Config:
     # --- Reward Weights & Scaling ---
     W_TARDINESS = 1.0
     W_MAINT_COST = 0.5
-    REWARD_SCALE = 100.0
+    W_STEP_PENALTY = 0.1
+    REWARD_SCALE = 10.0
     
     # --- Normalization Factors ---
     NORM_Q_LEN = 10.0
     NORM_TARDINESS = 50.0
     NORM_PROC_TIME = 20.0
-    NORM_AGE_ACCUM = 30.0 # [修正 2] 新增疲勞度正規化因子
+    NORM_AGE_ACCUM = 50.0 
     
     # --- RL Hyperparameters ---
     LR = 1e-4
     GAMMA = 0.99
-    BUFFER_SIZE = 10000
-    BATCH_SIZE = 64
+    BUFFER_SIZE = 20000
+    BATCH_SIZE = 128
     EPSILON_START = 1.0
     EPSILON_END = 0.05
-    EPSILON_DECAY = 10000 
+    EPSILON_DECAY = 15000
     TARGET_UPDATE = 200
     HIDDEN_DIM = 128
     GRAD_CLIP = 10.0
@@ -84,7 +87,28 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 # ==========================================
-# 2. Core Classes
+# 2. Efficient Replay Buffer
+# ==========================================
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+    
+    def push(self, state, action, reward, next_state, done, mask, next_mask):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done, mask, next_mask)
+        self.position = (self.position + 1) % self.capacity
+    
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+    
+    def __len__(self):
+        return len(self.buffer)
+
+# ==========================================
+# 3. Core Classes
 # ==========================================
 class Job:
     def __init__(self, job_id, arrival_time, ops_times):
@@ -123,7 +147,6 @@ class Machine:
         prob = Config.STATE_DEGRADE_PROB + (self.age_accum * 0.01)
         if random.random() < prob and self.state < Config.K_STATES:
             self.state += 1
-            self.age_accum = 0 
         return self.state >= Config.K_STATES 
 
     def repair_perfect(self):
@@ -134,13 +157,17 @@ class Machine:
         pass
 
 # ==========================================
-# 3. Advanced Event-Driven Environment
+# 4. Advanced Event-Driven Environment
 # ==========================================
 class AdvancedDFJSPEnv(gym.Env):
     def __init__(self):
         super(AdvancedDFJSPEnv, self).__init__()
         
-        self.action_space = spaces.Discrete(8)
+        # Action Space: 5 Discrete Actions
+        # 0-3: Dispatch Rules
+        # 4: Perform PM
+        self.action_space = spaces.Discrete(5)
+        
         self.state_dim = (3 * Config.NUM_MACHINES) + 3 + 1
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.state_dim,), dtype=np.float32)
         
@@ -180,7 +207,8 @@ class AdvancedDFJSPEnv(gym.Env):
         while True:
             idle_machines = [m.id for m in self.machines if m.status == 0]
             if idle_machines and self.job_buffer:
-                return idle_machines[0] 
+                # 隨機選擇閒置機器，消除偏差
+                return random.choice(idle_machines)
 
             if not self.event_queue:
                 self._schedule_next_arrival()
@@ -288,13 +316,18 @@ class AdvancedDFJSPEnv(gym.Env):
     def step(self, action):
         machine = self.machines[self.decision_machine_id]
         
-        rule_idx = action % 4      
-        do_pm = (action >= 4)   
+        is_pm = (action == 4)
+        rule_idx = action if not is_pm else 0
         
         reward = self.accumulated_reward
         self.accumulated_reward = 0.0
         
-        if do_pm:
+        # 稠密獎勵
+        if self.active_jobs:
+            current_avg_tardiness = np.mean([j.get_tardiness(self.now) for j in self.active_jobs])
+            reward -= Config.W_STEP_PENALTY * current_avg_tardiness
+        
+        if is_pm:
             self._start_maintenance(machine, 'PM', Config.TIME_PM, was_busy=(machine.status==1), wait_time=0)
             reward -= Config.W_MAINT_COST
             
@@ -342,7 +375,6 @@ class AdvancedDFJSPEnv(gym.Env):
             m_feats.extend([
                 m.state / Config.K_STATES,     
                 1.0 if m.status == 1 else 0.0, 
-                # [修正 2] 啟用有效特徵：累積疲勞度
                 np.tanh(m.age_accum / Config.NORM_AGE_ACCUM)
             ])
             
@@ -357,9 +389,9 @@ class AdvancedDFJSPEnv(gym.Env):
         
         state = np.array(m_feats + [q_len, avg_tard, avg_proc, crew_ratio], dtype=np.float32)
         
-        mask = np.ones(8, dtype=np.float32)
+        mask = np.ones(5, dtype=np.float32)
         if self.avail_crews <= 0:
-            mask[4:] = 0.0 
+            mask[4] = 0.0 
             
         return state, mask
 
@@ -384,7 +416,7 @@ class DQNAgent:
         self.target_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=Config.LR)
-        self.memory = deque(maxlen=Config.BUFFER_SIZE)
+        self.memory = ReplayBuffer(Config.BUFFER_SIZE)
         self.steps = 0
         self.action_dim = action_dim
         
@@ -408,7 +440,7 @@ class DQNAgent:
 
     def update(self):
         if len(self.memory) < Config.BATCH_SIZE: return
-        batch = random.sample(self.memory, Config.BATCH_SIZE)
+        batch = self.memory.sample(Config.BATCH_SIZE)
         state, action, reward, next_state, done, mask, next_mask = zip(*batch)
         
         state = torch.FloatTensor(np.array(state)).to(self.device)
@@ -457,7 +489,7 @@ def run_advanced_experiment():
         action = agent.select_action(state, mask)
         (next_state, next_mask), r, done, _, _ = env.step(action)
         
-        agent.memory.append((state, action, r, next_state, done, mask, next_mask))
+        agent.memory.push(state, action, r, next_state, done, mask, next_mask)
         agent.update()
         
         state = next_state
