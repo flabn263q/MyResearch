@@ -163,7 +163,7 @@ class AdvancedDFJSPEnv(gym.Env):
         # 快轉到第一個決策點
         self.decision_machine_id = self._resume_simulation()
         
-        # [修正 2] 清除熱身階段的罰分，並回傳符合 Gym 格式的 (obs, info)
+        # 清除熱身階段的罰分
         self.accumulated_reward = 0.0
         return self._get_state(), {}
 
@@ -240,7 +240,7 @@ class AdvancedDFJSPEnv(gym.Env):
                 machine = self.machines[m_id]
                 self.avail_crews += 1
                 
-                # [修正 1] 檢查機器是否還有未完成的工件 (被隨機故障打斷)
+                # 檢查機器是否還有未完成的工件 (被隨機故障打斷)
                 if self.now < machine.current_job_finish_time:
                     machine.status = 1 # 繼續忙碌 (Busy)
                 else:
@@ -251,28 +251,43 @@ class AdvancedDFJSPEnv(gym.Env):
                 elif m_type == 'MINIMAL':
                     machine.repair_minimal()
                 
+                # [修正 3] 從隊列取出並計算等待時間
                 if self.repair_queue:
-                    next_m_id, next_type, next_dur = self.repair_queue.popleft()
-                    self._start_maintenance(self.machines[next_m_id], next_type, next_dur)
+                    next_m_id, next_type, next_dur, next_busy, request_time = self.repair_queue.popleft()
+                    wait_time = self.now - request_time
+                    self._start_maintenance(self.machines[next_m_id], next_type, next_dur, 
+                                          was_busy=next_busy, wait_time=wait_time)
 
     def _request_maintenance(self, machine, m_type, duration):
+        # [修正 1] 記錄 was_busy 與 request_time
+        was_busy = (machine.status == 1)
+        
         if self.avail_crews > 0:
-            self._start_maintenance(machine, m_type, duration)
+            self._start_maintenance(machine, m_type, duration, was_busy=was_busy, wait_time=0)
         else:
             machine.status = 3 # Waiting
-            self.repair_queue.append((machine.id, m_type, duration))
-            machine.history.append((-1, -1, self.now, self.now, 'WAIT')) 
+            self.repair_queue.append((machine.id, m_type, duration, was_busy, self.now))
+            # 這裡不寫 history，等真正開始修再寫 WAIT
 
-    def _start_maintenance(self, machine, m_type, duration):
+    def _start_maintenance(self, machine, m_type, duration, was_busy, wait_time):
+        # [修正 2] 核心修正：補償等待時間
         self.avail_crews -= 1
         
-        if machine.status == 1:
-            machine.current_job_finish_time += duration
+        # 如果機器原本在忙，或者在壞掉前是忙的
+        if machine.status == 1 or was_busy:
+            total_delay = duration + wait_time
+            machine.current_job_finish_time += total_delay
         
         machine.status = 2 # Down/Maint
         finish_time = self.now + duration
         heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (machine.id, m_type)))
+        
+        # 記錄維修
         machine.history.append((-1, -1, self.now, finish_time, m_type))
+        
+        # 記錄等待 (視覺化用)
+        if wait_time > 0:
+            machine.history.append((-1, -1, self.now - wait_time, self.now, 'WAIT'))
 
     def step(self, action):
         machine = self.machines[self.decision_machine_id]
@@ -285,7 +300,8 @@ class AdvancedDFJSPEnv(gym.Env):
         
         # 1. 執行維護決策 (PM)
         if do_pm:
-            self._start_maintenance(machine, 'PM', Config.TIME_PM)
+            # [修正 4] 呼叫時傳入 was_busy 與 wait_time=0
+            self._start_maintenance(machine, 'PM', Config.TIME_PM, was_busy=(machine.status==1), wait_time=0)
             reward -= Config.W_MAINT_COST
             
             self.decision_machine_id = self._resume_simulation()
@@ -422,7 +438,6 @@ def run_advanced_experiment():
     rewards = []
     avg_tardiness = []
     
-    # [修正 2] 接收 mask
     (state, mask), _ = env.reset(seed=Config.SEED)
     total_reward = 0
     
@@ -484,7 +499,8 @@ def run_advanced_experiment():
                 ax.add_patch(mpatches.Rectangle((start, m.id*10), dur, 9, facecolor='orange', hatch='..', edgecolor='black'))
                 ax.text(start+dur/2, m.id*10+4.5, "MR", ha='center', va='center', color='black', fontsize=8)
             elif 'WAIT' in type_:
-                ax.add_patch(mpatches.Rectangle((start, m.id*10), 2, 9, facecolor='gray', alpha=0.5))
+                ax.add_patch(mpatches.Rectangle((start, m.id*10), dur, 9, facecolor='gray', alpha=0.5))
+                ax.text(start+dur/2, m.id*10+4.5, "W", ha='center', va='center', color='white', fontsize=8)
                 
     ax.set_yticks([i*10+5 for i in range(Config.NUM_MACHINES)])
     ax.set_yticklabels([f'M{i}' for i in range(Config.NUM_MACHINES)])
