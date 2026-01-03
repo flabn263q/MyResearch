@@ -12,7 +12,6 @@ import torch.optim as optim
 import random
 import math
 import heapq
-# [修正] 補回 deque
 from collections import deque, namedtuple
 import os
 
@@ -53,7 +52,10 @@ class Config:
     TIME_CM = 30           
     TIME_MINIMAL = 5       
     
-    Q_LIMIT = 2            
+    MAX_CREWS = 2          # [修正 1] 改名，避免誤解為 Queue Limit
+    
+    # --- Action Definition ---
+    ACTION_PM = 4          # [修正 3] 定義 PM 動作索引，避免 Magic Number
     
     # --- Reward Weights & Scaling ---
     W_TARDINESS = 1.0
@@ -165,7 +167,7 @@ class AdvancedDFJSPEnv(gym.Env):
         
         # Action Space: 5 Discrete Actions
         # 0-3: Dispatch Rules
-        # 4: Perform PM
+        # 4: Perform PM (Config.ACTION_PM)
         self.action_space = spaces.Discrete(5)
         
         self.state_dim = (3 * Config.NUM_MACHINES) + 3 + 1
@@ -179,7 +181,7 @@ class AdvancedDFJSPEnv(gym.Env):
         
         self.now = 0.0
         self.event_queue = []    
-        self.avail_crews = Config.Q_LIMIT
+        self.avail_crews = Config.MAX_CREWS # [修正 1] 使用正確變數名
         self.job_counter = 0
         
         self.accumulated_reward = 0.0
@@ -207,7 +209,6 @@ class AdvancedDFJSPEnv(gym.Env):
         while True:
             idle_machines = [m.id for m in self.machines if m.status == 0]
             if idle_machines and self.job_buffer:
-                # 隨機選擇閒置機器，消除偏差
                 return random.choice(idle_machines)
 
             if not self.event_queue:
@@ -316,13 +317,13 @@ class AdvancedDFJSPEnv(gym.Env):
     def step(self, action):
         machine = self.machines[self.decision_machine_id]
         
-        is_pm = (action == 4)
+        # [修正 3] 使用 Config.ACTION_PM
+        is_pm = (action == Config.ACTION_PM)
         rule_idx = action if not is_pm else 0
         
         reward = self.accumulated_reward
         self.accumulated_reward = 0.0
         
-        # 稠密獎勵
         if self.active_jobs:
             current_avg_tardiness = np.mean([j.get_tardiness(self.now) for j in self.active_jobs])
             reward -= Config.W_STEP_PENALTY * current_avg_tardiness
@@ -337,9 +338,7 @@ class AdvancedDFJSPEnv(gym.Env):
             
             return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
         
-        if not self.job_buffer:
-            self.decision_machine_id = self._resume_simulation()
-            return self._get_state(), reward / Config.REWARD_SCALE, False, False, {}
+        # [修正 2] 移除死代碼 (if not self.job_buffer)
             
         selected_job = self._apply_rule(rule_idx, self.job_buffer)
         self.job_buffer.remove(selected_job) 
@@ -385,13 +384,13 @@ class AdvancedDFJSPEnv(gym.Env):
         else:
             q_len, avg_tard, avg_proc = 0, 0, 0
             
-        crew_ratio = self.avail_crews / Config.Q_LIMIT
+        crew_ratio = self.avail_crews / Config.MAX_CREWS # [修正 1]
         
         state = np.array(m_feats + [q_len, avg_tard, avg_proc, crew_ratio], dtype=np.float32)
         
         mask = np.ones(5, dtype=np.float32)
         if self.avail_crews <= 0:
-            mask[4] = 0.0 
+            mask[Config.ACTION_PM] = 0.0 # [修正 3]
             
         return state, mask
 
