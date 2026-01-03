@@ -233,9 +233,11 @@ class AdvancedDFJSPEnv(gym.Env):
             elif event_type == 'RANDOM_BREAKDOWN':
                 # [修正 1] 處理隨機故障
                 # 隨機挑選一台機器，如果是忙碌狀態則故障
-                target_m = random.choice(self.machines)
+                # 如果沒有機器在忙，這次故障就"pass"掉，但仍需排程下一次
+                busy_machines = [m for m in self.machines if m.status == 1]
                 
-                if target_m.status == 1: # Busy
+                if busy_machines:
+                    target_m = random.choice(busy_machines)
                     if self.avail_crews > 0:
                         self.avail_crews -= 1
                         target_m.status = 2
