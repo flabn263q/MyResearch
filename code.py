@@ -30,7 +30,6 @@ except ImportError:
 # ==========================================
 class Config:
     # --- Experiment Settings ---
-    # [修正 4] 增加訓練步數以確保收斂
     TRAIN_STEPS = 50000    
     EVAL_INTERVAL = 1000   
     SEED = 42
@@ -49,7 +48,7 @@ class Config:
     PROC_TIME_PENALTY = 0.1  
     
     # --- Dual Failure Modes ---
-    BREAKDOWN_RATE = 0.005 # Lambda for breakdown
+    BREAKDOWN_RATE = 0.005 
     
     # --- Maintenance Specs ---
     TIME_PM = 10           
@@ -61,7 +60,11 @@ class Config:
     # --- Reward Weights ---
     W_TARDINESS = 1.0
     W_MAINT_COST = 0.5
-    # PENALTY_INVALID 已移除，改用 Masking
+    
+    # --- Normalization Factors [修正 2] ---
+    NORM_Q_LEN = 10.0
+    NORM_TARDINESS = 50.0
+    NORM_PROC_TIME = 20.0
     
     # --- RL Hyperparameters ---
     LR = 1e-4
@@ -70,7 +73,6 @@ class Config:
     BATCH_SIZE = 64
     EPSILON_START = 1.0
     EPSILON_END = 0.05
-    # [修正 4] 調整 Decay 讓 Agent 有更多時間利用策略
     EPSILON_DECAY = 10000 
     TARGET_UPDATE = 200
     HIDDEN_DIM = 128
@@ -103,9 +105,12 @@ class Machine:
     def __init__(self, m_id):
         self.id = m_id
         self.state = 0       
-        self.status = 0      # 0: Idle, 1: Busy, 2: Down/Maint
+        self.status = 0      # 0: Idle, 1: Busy, 2: Down/Maint, 3: Waiting for Repair
         self.age_accum = 0.0 
         self.history = []    
+        
+        # [修正 4] 用於處理隨機故障導致的工件延遲 (Lazy Update)
+        self.current_job_finish_time = 0.0 
 
     def get_actual_proc_time(self, base_time):
         return base_time * (1.0 + self.state * Config.PROC_TIME_PENALTY)
@@ -131,12 +136,7 @@ class AdvancedDFJSPEnv(gym.Env):
     def __init__(self):
         super(AdvancedDFJSPEnv, self).__init__()
         
-        # Action Space: 8 Discrete Actions
-        # 0-3: Rules without PM
-        # 4-7: Rules with PM
         self.action_space = spaces.Discrete(8)
-        
-        # State Space
         self.state_dim = (3 * Config.NUM_MACHINES) + 3 + 1
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.state_dim,), dtype=np.float32)
         
@@ -156,31 +156,32 @@ class AdvancedDFJSPEnv(gym.Env):
         self.avail_crews = Config.Q_LIMIT
         self.job_counter = 0
         
-        # 初始事件
+        # [修正 1] 累積獎勵機制
+        self.accumulated_reward = 0.0
+        
+        # [修正 4] 維修等待隊列 (FIFO)
+        self.repair_queue = deque() # stores (machine_id, repair_type, duration)
+        
         self._schedule_next_arrival()
-        # [修正 1] 初始安排隨機故障
         self._schedule_next_breakdown()
         
-        # 快轉到第一個決策點
         self.decision_machine_id = self._resume_simulation()
         
-        return self._get_state(), {}
+        return self._get_state()
 
     def _schedule_next_arrival(self):
         inter_arrival = random.expovariate(Config.ARRIVAL_RATE)
         arrival_time = self.now + inter_arrival
         heapq.heappush(self.event_queue, (arrival_time, 'JOB_ARRIVAL', None))
 
-    # [修正 1] 新增隨機故障排程
     def _schedule_next_breakdown(self):
-        # 全系統共享一個故障流 (Poisson Process)
+        # [修正 4] 獨立的故障事件流，不依賴系統狀態
         inter_breakdown = random.expovariate(Config.BREAKDOWN_RATE)
         fail_time = self.now + inter_breakdown
         heapq.heappush(self.event_queue, (fail_time, 'RANDOM_BREAKDOWN', None))
 
     def _resume_simulation(self):
         while True:
-            # 決策觸發條件
             idle_machines = [m.id for m in self.machines if m.status == 0]
             if idle_machines and self.job_buffer:
                 return idle_machines[0] 
@@ -203,6 +204,13 @@ class AdvancedDFJSPEnv(gym.Env):
             elif event_type == 'JOB_FINISH':
                 m_id, j_id = data
                 machine = self.machines[m_id]
+                
+                # [修正 4] Lazy Update: 檢查工件是否因故障被推遲
+                if self.now < machine.current_job_finish_time:
+                    # 時間對不上，代表中間發生過故障，重新排程事件
+                    heapq.heappush(self.event_queue, (machine.current_job_finish_time, 'JOB_FINISH', data))
+                    continue
+
                 job = next((j for j in self.active_jobs if j.id == j_id), None)
                 
                 if job:
@@ -212,6 +220,10 @@ class AdvancedDFJSPEnv(gym.Env):
                         job.completion_time = self.now
                         self.active_jobs.remove(job)
                         self.finished_jobs.append(job)
+                        
+                        # [修正 1] 工件完成時計算 Tardiness Reward
+                        tardiness = job.get_tardiness(self.now)
+                        self.accumulated_reward -= Config.W_TARDINESS * tardiness
                     else:
                         self.job_buffer.append(job)
                 
@@ -220,39 +232,20 @@ class AdvancedDFJSPEnv(gym.Env):
                 
                 if is_failed:
                     # 老化故障 -> 強制 CM
-                    if self.avail_crews > 0:
-                        self.avail_crews -= 1
-                        machine.status = 2 
-                        finish_time = self.now + Config.TIME_CM
-                        heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (m_id, 'CM')))
-                        machine.history.append((-1, -1, self.now, finish_time, 'CM'))
-                    else:
-                        machine.status = 2 
-                        heapq.heappush(self.event_queue, (self.now + 1.0, 'WAIT_RESOURCE', m_id))
+                    self._request_maintenance(machine, 'CM', Config.TIME_CM)
 
             elif event_type == 'RANDOM_BREAKDOWN':
-                # [修正 1] 處理隨機故障
-                # 隨機挑選一台機器，如果是忙碌狀態則故障
-                # 如果沒有機器在忙，這次故障就"pass"掉，但仍需排程下一次
-                busy_machines = [m for m in self.machines if m.status == 1]
-                
-                if busy_machines:
-                    target_m = random.choice(busy_machines)
-                    if self.avail_crews > 0:
-                        self.avail_crews -= 1
-                        target_m.status = 2
-                        finish_time = self.now + Config.TIME_MINIMAL
-                        heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (target_m.id, 'MINIMAL')))
-                        target_m.history.append((-1, -1, self.now, finish_time, 'MINIMAL'))
-                        # 簡化：假設故障不影響當前工件的完成時間 (或視為工件被延後)
-                    else:
-                        # 沒人修，稍後再試 (Retry breakdown event)
-                        heapq.heappush(self.event_queue, (self.now + 5.0, 'RANDOM_BREAKDOWN', None))
-                        # 注意：這裡不呼叫 _schedule_next_breakdown，因為這是 Retry
-                        continue 
-                
-                # 安排下一次隨機故障
+                # [修正 4] 隨機故障邏輯
+                # 1. 安排下一次故障 (保持 Poisson 流)
                 self._schedule_next_breakdown()
+                
+                # 2. 隨機挑選一台機器故障
+                target_m = random.choice(self.machines)
+                
+                # 只有忙碌的機器才會受到影響 (簡化假設)
+                if target_m.status == 1: 
+                    # 機器故障，工件被延遲
+                    self._request_maintenance(target_m, 'MINIMAL', Config.TIME_MINIMAL)
 
             elif event_type == 'MAINT_FINISH':
                 m_id, m_type = data
@@ -264,17 +257,38 @@ class AdvancedDFJSPEnv(gym.Env):
                     machine.repair_perfect()
                 elif m_type == 'MINIMAL':
                     machine.repair_minimal()
-            
-            elif event_type == 'WAIT_RESOURCE':
-                m_id = data
-                if self.avail_crews > 0:
-                    self.avail_crews -= 1
-                    self.machines[m_id].status = 2
-                    finish_time = self.now + Config.TIME_CM
-                    heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (m_id, 'CM')))
-                    self.machines[m_id].history.append((-1, -1, self.now, finish_time, 'CM'))
-                else:
-                    heapq.heappush(self.event_queue, (self.now + 1.0, 'WAIT_RESOURCE', m_id))
+                
+                # [修正 4] 檢查是否有機器在排隊等待維修
+                if self.repair_queue:
+                    next_m_id, next_type, next_dur = self.repair_queue.popleft()
+                    self._start_maintenance(self.machines[next_m_id], next_type, next_dur)
+
+    def _request_maintenance(self, machine, m_type, duration):
+        """請求維修的統一接口"""
+        if self.avail_crews > 0:
+            self._start_maintenance(machine, m_type, duration)
+        else:
+            # 資源不足，進入等待狀態
+            machine.status = 3 # Waiting
+            self.repair_queue.append((machine.id, m_type, duration))
+            # 記錄等待開始時間 (可選)
+            machine.history.append((-1, -1, self.now, self.now, 'WAIT')) 
+
+    def _start_maintenance(self, machine, m_type, duration):
+        """開始執行維修"""
+        self.avail_crews -= 1
+        
+        # 如果機器原本在忙 (隨機故障)，工件完成時間要推遲
+        if machine.status == 1:
+            machine.current_job_finish_time += duration
+            # 這裡不改變 machine.status 為 2，因為邏輯上它還是佔用著工件
+            # 但為了畫圖和狀態表示，我們暫時設為 2 (Down)，
+            # JOB_FINISH 事件會透過 Lazy Update 處理時間差
+        
+        machine.status = 2 # Down/Maint
+        finish_time = self.now + duration
+        heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (machine.id, m_type)))
+        machine.history.append((-1, -1, self.now, finish_time, m_type))
 
     def step(self, action):
         machine = self.machines[self.decision_machine_id]
@@ -282,26 +296,28 @@ class AdvancedDFJSPEnv(gym.Env):
         rule_idx = action % 4      
         do_pm = (action >= 4)   
         
-        reward = 0
+        # 獎勵重置
+        reward = self.accumulated_reward
+        self.accumulated_reward = 0.0
         
-        # 1. 執行維護決策
-        # [修正 2] 由於有 Masking，這裡不需要再檢查資源不足的情況
-        # Agent 選了 PM，代表一定有資源
+        # 1. 執行維護決策 (PM)
         if do_pm:
-            self.avail_crews -= 1
-            machine.status = 2
-            finish_time = self.now + Config.TIME_PM
-            heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (machine.id, 'PM')))
-            machine.history.append((-1, -1, self.now, finish_time, 'PM'))
-            
+            # 由於有 Masking，這裡 avail_crews 一定 > 0
+            self._start_maintenance(machine, 'PM', Config.TIME_PM)
             reward -= Config.W_MAINT_COST
             
             self.decision_machine_id = self._resume_simulation()
+            # 加上這段時間累積的 Tardiness
+            reward += self.accumulated_reward
+            self.accumulated_reward = 0.0
+            
+            # [修正] 使用逗號分隔，保持巢狀結構 ((state, mask), reward, ...)
             return self._get_state(), reward, False, False, {}
         
         # 2. 執行派工決策
         if not self.job_buffer:
             self.decision_machine_id = self._resume_simulation()
+            # [原本正確]
             return self._get_state(), reward, False, False, {}
             
         selected_job = self._apply_rule(rule_idx, self.job_buffer)
@@ -313,27 +329,25 @@ class AdvancedDFJSPEnv(gym.Env):
         machine.status = 1 
         machine.age_accum += actual_time
         finish_time = self.now + actual_time
+        machine.current_job_finish_time = finish_time 
         
         machine.history.append((selected_job.id, selected_job.current_op_idx, self.now, finish_time, 'JOB'))
         heapq.heappush(self.event_queue, (finish_time, 'JOB_FINISH', (machine.id, selected_job.id)))
         
-        # 3. 計算 Tardiness Reward
-        current_tardiness = sum([j.get_tardiness(self.now) for j in self.active_jobs])
-        reward -= Config.W_TARDINESS * current_tardiness
-        
         self.decision_machine_id = self._resume_simulation()
         
+        # 加上這段時間累積的 Tardiness
+        reward += self.accumulated_reward
+        self.accumulated_reward = 0.0
+        
+        # [修正] 使用逗號分隔
         return self._get_state(), reward, False, False, {}
 
     def _apply_rule(self, rule_idx, jobs):
-        if rule_idx == 0: # FIFO
-            return min(jobs, key=lambda j: j.arrival_time)
-        elif rule_idx == 1: # SPT
-            return min(jobs, key=lambda j: j.get_base_proc_time())
-        elif rule_idx == 2: # EDD
-            return min(jobs, key=lambda j: j.due_date)
-        elif rule_idx == 3: # SRPT
-            return min(jobs, key=lambda j: sum(j.ops_times[j.current_op_idx:]))
+        if rule_idx == 0: return min(jobs, key=lambda j: j.arrival_time)
+        elif rule_idx == 1: return min(jobs, key=lambda j: j.get_base_proc_time())
+        elif rule_idx == 2: return min(jobs, key=lambda j: j.due_date)
+        elif rule_idx == 3: return min(jobs, key=lambda j: sum(j.ops_times[j.current_op_idx:]))
         return jobs[0]
 
     def _get_state(self):
@@ -346,12 +360,11 @@ class AdvancedDFJSPEnv(gym.Env):
                 0.0 
             ])
             
-        # 2. Buffer Features
-        # [修正 3] 使用 tanh 進行數值穩定化
+        # 2. Buffer Features [修正 2] 使用 Config 參數進行標準化
         if self.job_buffer:
-            q_len = np.tanh(len(self.job_buffer) / 10.0) 
-            avg_tard = np.tanh(np.mean([j.get_tardiness(self.now) for j in self.job_buffer]) / 50.0)
-            avg_proc = np.tanh(np.mean([j.get_base_proc_time() for j in self.job_buffer]) / 20.0)
+            q_len = np.tanh(len(self.job_buffer) / Config.NORM_Q_LEN) 
+            avg_tard = np.tanh(np.mean([j.get_tardiness(self.now) for j in self.job_buffer]) / Config.NORM_TARDINESS)
+            avg_proc = np.tanh(np.mean([j.get_base_proc_time() for j in self.job_buffer]) / Config.NORM_PROC_TIME)
         else:
             q_len, avg_tard, avg_proc = 0, 0, 0
             
@@ -360,12 +373,10 @@ class AdvancedDFJSPEnv(gym.Env):
         
         state = np.array(m_feats + [q_len, avg_tard, avg_proc, crew_ratio], dtype=np.float32)
         
-        # [修正 2] 產生 Action Mask
-        # 0-3: No PM (Always valid if buffer not empty)
-        # 4-7: PM (Valid only if crew > 0)
+        # Action Mask
         mask = np.ones(8, dtype=np.float32)
         if self.avail_crews <= 0:
-            mask[4:] = 0.0 # 封鎖 PM 動作
+            mask[4:] = 0.0 
             
         return state, mask
 
@@ -397,14 +408,12 @@ class DQNAgent:
               math.exp(-1. * self.steps / Config.EPSILON_DECAY)
         self.steps += 1
         
-        # [修正 2] 支援 Masking 的 Epsilon-Greedy
         if training and random.random() < eps:
             valid_indices = [i for i, m in enumerate(mask) if m == 1.0]
             return random.choice(valid_indices)
         
         with torch.no_grad():
             q_values = self.policy_net(torch.FloatTensor(state))
-            # Masking: 將無效動作 Q 值設為極小
             inf_mask = (torch.FloatTensor(mask) - 1) * 1e9
             masked_q = q_values + inf_mask
             return masked_q.argmax().item()
@@ -419,7 +428,6 @@ class DQNAgent:
         reward = torch.FloatTensor(reward).unsqueeze(1)
         next_state = torch.FloatTensor(np.array(next_state))
         done = torch.FloatTensor(done).unsqueeze(1)
-        # next_mask 用於 Double DQN 或未來擴充，目前標準 DQN 暫不需要
         
         q_val = self.policy_net(state).gather(1, action)
         next_q = self.target_net(next_state).max(1)[0].unsqueeze(1)
@@ -441,17 +449,14 @@ def run_advanced_experiment():
     rewards = []
     avg_tardiness = []
     
-    # [修正 2] 接收 mask
-    (state, mask), _ = env.reset(seed=Config.SEED)
+    (state, mask) = env.reset(seed=Config.SEED)
     total_reward = 0
     
     pbar = tqdm(range(Config.TRAIN_STEPS))
     for step in pbar:
-        # [修正 2] 傳入 mask
         action = agent.select_action(state, mask)
         (next_state, next_mask), r, done, _, _ = env.step(action)
         
-        # 儲存 mask 資訊 (雖然標準 DQN update 沒用到 next_mask，但存著好)
         agent.memory.append((state, action, r, next_state, done, mask, next_mask))
         agent.update()
         
@@ -504,6 +509,9 @@ def run_advanced_experiment():
             elif 'MINIMAL' in type_:
                 ax.add_patch(mpatches.Rectangle((start, m.id*10), dur, 9, facecolor='orange', hatch='..', edgecolor='black'))
                 ax.text(start+dur/2, m.id*10+4.5, "MR", ha='center', va='center', color='black', fontsize=8)
+            elif 'WAIT' in type_:
+                # 畫出等待資源的空檔 (灰色)
+                ax.add_patch(mpatches.Rectangle((start, m.id*10), 2, 9, facecolor='gray', alpha=0.5))
                 
     ax.set_yticks([i*10+5 for i in range(Config.NUM_MACHINES)])
     ax.set_yticklabels([f'M{i}' for i in range(Config.NUM_MACHINES)])
