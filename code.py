@@ -17,13 +17,8 @@ from collections import deque, namedtuple
 import copy
 import time
 import os
+from tqdm import tqdm
 
-# 防呆機制
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterator, *args, **kwargs):
-        return iterator
 
 # ==========================================
 # 1. Configuration
@@ -31,7 +26,7 @@ except ImportError:
 class Config:
     # --- Experiment Settings ---
     TRAIN_STEPS = 50000    
-    EVAL_INTERVAL = 1000   
+    EVAL_INTERVAL = 1000 
     SEED = 42
     
     # --- Environment Dimensions ---
@@ -163,6 +158,7 @@ class AdvancedDFJSPEnv(gym.Env):
         # 快轉到第一個決策點
         self.decision_machine_id = self._resume_simulation()
         
+        # 清除熱身階段的罰分
         self.accumulated_reward = 0.0
         return self._get_state(), {}
 
@@ -201,19 +197,15 @@ class AdvancedDFJSPEnv(gym.Env):
                 m_id, j_id = data
                 machine = self.machines[m_id]
                 
-                # Lazy Update
+                # Lazy Update: 檢查工件是否因故障被推遲
                 if self.now < machine.current_job_finish_time:
                     heapq.heappush(self.event_queue, (machine.current_job_finish_time, 'JOB_FINISH', data))
                     continue
 
                 # [視覺化修正] 更新歷史紀錄中的結束時間
-                # 找到該機器歷史中對應此工件的紀錄，更新其 end_time 為當前真實時間
-                # 倒序搜尋，因為剛完成的工件通常在最後
                 for i in range(len(machine.history) - 1, -1, -1):
                     entry = machine.history[i]
-                    # entry: (job_id, op_idx, start, end, type)
                     if entry[0] == j_id and entry[4] == 'JOB':
-                        # Tuple 是不可變的，需替換
                         machine.history[i] = (entry[0], entry[1], entry[2], self.now, entry[4])
                         break
 
@@ -250,6 +242,7 @@ class AdvancedDFJSPEnv(gym.Env):
                 machine = self.machines[m_id]
                 self.avail_crews += 1
                 
+                # [邏輯修正] 檢查機器是否還有未完成的工件
                 if self.now < machine.current_job_finish_time:
                     machine.status = 1 # Busy
                 else:
@@ -509,6 +502,10 @@ def run_advanced_experiment():
     ax.set_title(f"Advanced Schedule Snapshot (Time {env.now:.0f})")
     plt.savefig("advanced_gantt.png")
     print("Saved advanced_gantt.png")
+    
+    # [新增] 保存模型
+    torch.save(agent.policy_net.state_dict(), "advanced_dqn_model.pth")
+    print("Model saved as advanced_dqn_model.pth")
 
 if __name__ == "__main__":
     run_advanced_experiment()
