@@ -41,8 +41,8 @@ class Config:
     
     # --- Machine Deterioration (Calibrated) ---
     K_STATES = 5           
-    STATE_DEGRADE_PROB = 0.01  # [修正 3] 降低基礎老化機率
-    AGE_DEGRADE_COEFF = 0.001  # [修正 3] 降低疲勞老化係數
+    STATE_DEGRADE_PROB = 0.01  # [修正 3] 降低基礎老化機率，避免機器像紙糊的
+    AGE_DEGRADE_COEFF = 0.001  # [修正 3] 新增疲勞老化係數
     PROC_TIME_PENALTY = 0.1  
     
     # --- Dual Failure Modes ---
@@ -175,11 +175,11 @@ class Machine:
         return base_time * (1.0 + self.state * Config.PROC_TIME_PENALTY)
 
     def degrade(self):
-        # [修正 3] 物理模型校準
+        # [修正 3] 物理模型校準：機率隨「當前狀態累積時間」增加
         prob = Config.STATE_DEGRADE_PROB + (self.age_accum * Config.AGE_DEGRADE_COEFF)
         if random.random() < prob and self.state < Config.K_STATES:
             self.state += 1
-            self.age_accum = 0 
+            self.age_accum = 0 # 狀態改變，累積歸零 (Semi-Markov)
         return self.state >= Config.K_STATES 
 
     def repair_perfect(self):
@@ -355,7 +355,7 @@ class AdvancedDFJSPEnv(gym.Env):
         reward = self.accumulated_reward
         self.accumulated_reward = 0.0
         
-        # [修正 2] 獎勵計算：Sum over Mean
+        # [修正 2] 獎勵計算：Sum over Mean (Total Tardiness)
         if self.active_jobs:
             current_total_tardiness = np.sum([j.get_tardiness(self.now) for j in self.active_jobs])
             reward -= Config.W_STEP_PENALTY * current_total_tardiness
@@ -421,9 +421,12 @@ class AdvancedDFJSPEnv(gym.Env):
             
         if self.job_buffer:
             q_len = np.tanh(len(self.job_buffer) / Config.NORM_Q_LEN) 
-            # [修正 1] 感知對齊：統計 active_jobs 而非 job_buffer
-            avg_tard = np.tanh(np.mean([j.get_tardiness(self.now) for j in self.active_jobs]) / Config.NORM_TARDINESS)
-            avg_proc = np.tanh(np.mean([j.get_base_proc_time() for j in self.active_jobs]) / Config.NORM_PROC_TIME)
+            # [修正 1] 感知對齊：統計 active_jobs (全系統) 而非 job_buffer
+            if self.active_jobs:
+                avg_tard = np.tanh(np.mean([j.get_tardiness(self.now) for j in self.active_jobs]) / Config.NORM_TARDINESS)
+                avg_proc = np.tanh(np.mean([j.get_base_proc_time() for j in self.active_jobs]) / Config.NORM_PROC_TIME)
+            else:
+                avg_tard, avg_proc = 0, 0
         else:
             q_len, avg_tard, avg_proc = 0, 0, 0
             
@@ -479,6 +482,7 @@ class DQNAgent:
         
         if training and random.random() < eps:
             valid_indices = [i for i, m in enumerate(mask) if m == 1.0]
+            if not valid_indices: return 0 
             return random.choice(valid_indices)
         
         with torch.no_grad():
