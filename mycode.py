@@ -283,6 +283,7 @@ class AdvancedDFJSPEnv(gym.Env):
                         job.completion_time = self.now
                         self.active_jobs.remove(job)
                         self.finished_jobs.append(job)
+                        # [修正 4] 移除終局獎勵，避免雙重計算
                     else:
                         self.job_buffer.append(job)
                 
@@ -478,7 +479,6 @@ class DQNAgent:
         
         if training and random.random() < eps:
             valid_indices = [i for i, m in enumerate(mask) if m == 1.0]
-            if not valid_indices: return 0 
             return random.choice(valid_indices)
         
         with torch.no_grad():
