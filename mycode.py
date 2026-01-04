@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use('Agg')  # Force non-interactive backend for saving plots
+matplotlib.use('Agg')
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -15,7 +15,7 @@ import heapq
 from collections import deque
 import os
 
-# Fallback for tqdm if not installed
+# 防呆機制
 try:
     from tqdm import tqdm
 except ImportError:
@@ -35,33 +35,33 @@ class Config:
     NUM_MACHINES = 5
     NUM_OPS_PER_JOB = 5
     
-    # --- Job Arrival (Poisson Process) ---
-    ARRIVAL_RATE = 0.15    # Lambda
+    # --- Job Arrival (Poisson) ---
+    ARRIVAL_RATE = 0.15    
     DUE_DATE_FACTOR = 1.5  
     
-    # --- Machine Deterioration (Discrete Multi-state) ---
-    K_STATES = 5           # 0 (New) ~ 5 (Failed)
-    STATE_DEGRADE_PROB = 0.01  # [Verified] Low base probability
-    AGE_DEGRADE_COEFF = 0.001  # [Verified] Fatigue coefficient
-    PROC_TIME_PENALTY = 0.1    # Processing gets slower as state increases
+    # --- Machine Deterioration (Calibrated) ---
+    K_STATES = 5           
+    STATE_DEGRADE_PROB = 0.01  # [修正 3] 降低基礎老化機率，避免機器像紙糊的
+    AGE_DEGRADE_COEFF = 0.001  # [修正 3] 新增疲勞老化係數
+    PROC_TIME_PENALTY = 0.1  
     
     # --- Dual Failure Modes ---
-    BREAKDOWN_RATE = 0.005 # Random breakdown lambda
+    BREAKDOWN_RATE = 0.005 
     
     # --- Maintenance Specs ---
-    TIME_PM = 10           # Preventive Maintenance (Perfect Repair)
-    TIME_CM = 30           # Corrective Maintenance (Perfect Repair)
-    TIME_MINIMAL = 5       # Minimal Repair (State unchanged)
+    TIME_PM = 10           
+    TIME_CM = 30           
+    TIME_MINIMAL = 5       
     
-    MAX_CREWS = 2          # Resource Constraint
+    MAX_CREWS = 2          
     
     # --- Action Definition ---
-    ACTION_PM = 4          # Action index 4 triggers PM
+    ACTION_PM = 4          
     
     # --- Reward Weights & Scaling ---
     W_MAINT_COST = 0.5
-    W_STEP_PENALTY = 1.0   # Weight for Total Tardiness
-    REWARD_SCALE = 100.0   # [CRITICAL FIX] Scaled up for Sum-based reward
+    W_STEP_PENALTY = 1.0  
+    REWARD_SCALE = 100.0       # [修正 2] 因應 Sum Reward 數值變大，調大縮放因子
     
     # --- Normalization Factors ---
     NORM_Q_LEN = 10.0
@@ -102,7 +102,6 @@ class ReplayBuffer:
         self.ptr = 0
         self.size = 0
         
-        # Pre-allocate memory for efficiency
         self.states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.actions = np.zeros((capacity, 1), dtype=np.int64)
         self.rewards = np.zeros((capacity, 1), dtype=np.float32)
@@ -176,11 +175,11 @@ class Machine:
         return base_time * (1.0 + self.state * Config.PROC_TIME_PENALTY)
 
     def degrade(self):
-        # [Verified] Physics: Probability increases with accumulated age
+        # [修正 3] 物理模型校準：機率隨「當前狀態累積時間」增加
         prob = Config.STATE_DEGRADE_PROB + (self.age_accum * Config.AGE_DEGRADE_COEFF)
         if random.random() < prob and self.state < Config.K_STATES:
             self.state += 1
-            self.age_accum = 0 # Reset accumulation on state change (Semi-Markov)
+            self.age_accum = 0 # 狀態改變，累積歸零 (Semi-Markov)
         return self.state >= Config.K_STATES 
 
     def repair_perfect(self):
@@ -202,13 +201,9 @@ class AdvancedDFJSPEnv(gym.Env):
     def __init__(self):
         super(AdvancedDFJSPEnv, self).__init__()
         
-        # Action Space: 5 Discrete Actions
-        # 0-3: Dispatch Rules (FIFO, SPT, EDD, SRPT)
-        # 4: Perform PM
         self.action_space = spaces.Discrete(5)
         
         # State Dim: (7 * M) + 3 + 1
-        # Machine: [State, Idle, Busy, Down, Age, Remain, FailCount]
         self.state_dim = (7 * Config.NUM_MACHINES) + 3 + 1
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.state_dim,), dtype=np.float32)
         
@@ -229,7 +224,6 @@ class AdvancedDFJSPEnv(gym.Env):
         self._schedule_next_arrival()
         self._schedule_next_breakdown()
         
-        # Fast forward to first decision point
         self.decision_machine_id = self._resume_simulation()
         
         self.accumulated_reward = 0.0
@@ -270,12 +264,10 @@ class AdvancedDFJSPEnv(gym.Env):
                 m_id, j_id = data
                 machine = self.machines[m_id]
                 
-                # Lazy Update: Check if job was delayed by breakdown
                 if self.now < machine.current_job_finish_time:
                     heapq.heappush(self.event_queue, (machine.current_job_finish_time, 'JOB_FINISH', data))
                     continue
 
-                # Update history for visualization
                 for i in range(len(machine.history) - 1, -1, -1):
                     entry = machine.history[i]
                     if entry[0] == j_id and entry[4] == 'JOB':
@@ -291,10 +283,11 @@ class AdvancedDFJSPEnv(gym.Env):
                         job.completion_time = self.now
                         self.active_jobs.remove(job)
                         self.finished_jobs.append(job)
+                        # [修正 4] 移除終局獎勵，避免雙重計算
                     else:
                         self.job_buffer.append(job)
                 
-                machine.status = 0 # Idle
+                machine.status = 0 
                 is_failed = machine.degrade()
                 
                 if is_failed:
@@ -313,9 +306,9 @@ class AdvancedDFJSPEnv(gym.Env):
                 self.avail_crews += 1
                 
                 if self.now < machine.current_job_finish_time:
-                    machine.status = 1 # Still busy with delayed job
+                    machine.status = 1 
                 else:
-                    machine.status = 0 # Idle
+                    machine.status = 0 
                 
                 if m_type == 'PM' or m_type == 'CM':
                     machine.repair_perfect()
@@ -334,7 +327,7 @@ class AdvancedDFJSPEnv(gym.Env):
         if self.avail_crews > 0:
             self._start_maintenance(machine, m_type, duration, was_busy=was_busy, wait_time=0)
         else:
-            machine.status = 3 # Waiting
+            machine.status = 3 
             self.repair_queue.append((machine.id, m_type, duration, was_busy, self.now))
 
     def _start_maintenance(self, machine, m_type, duration, was_busy, wait_time):
@@ -344,7 +337,7 @@ class AdvancedDFJSPEnv(gym.Env):
             total_delay = duration + wait_time
             machine.current_job_finish_time += total_delay
         
-        machine.status = 2 # Down/Maint
+        machine.status = 2 
         finish_time = self.now + duration
         heapq.heappush(self.event_queue, (finish_time, 'MAINT_FINISH', (machine.id, m_type)))
         
@@ -362,7 +355,7 @@ class AdvancedDFJSPEnv(gym.Env):
         reward = self.accumulated_reward
         self.accumulated_reward = 0.0
         
-        # [CRITICAL FIX 1] Sum over Mean for Total Tardiness
+        # [修正 2] 獎勵計算：Sum over Mean (Total Tardiness)
         if self.active_jobs:
             current_total_tardiness = np.sum([j.get_tardiness(self.now) for j in self.active_jobs])
             reward -= Config.W_STEP_PENALTY * current_total_tardiness
@@ -412,12 +405,10 @@ class AdvancedDFJSPEnv(gym.Env):
     def _get_state(self):
         m_feats = []
         for m in self.machines:
-            # One-Hot Encoding
             is_idle = 1.0 if m.status == 0 else 0.0
             is_busy = 1.0 if m.status == 1 else 0.0
             is_down = 1.0 if m.status >= 2 else 0.0
             
-            # [Verified] Remaining Time Feature
             remain_time = max(0, m.current_job_finish_time - self.now)
             
             m_feats.extend([
@@ -425,12 +416,12 @@ class AdvancedDFJSPEnv(gym.Env):
                 is_idle, is_busy, is_down,
                 np.tanh(m.age_accum / Config.NORM_AGE_ACCUM),
                 np.tanh(remain_time / Config.NORM_REMAIN_TIME),
-                np.tanh(m.failure_count / Config.NORM_FAIL_COUNT) # [Verified] Failure Count Feature
+                np.tanh(m.failure_count / Config.NORM_FAIL_COUNT)
             ])
             
         if self.job_buffer:
             q_len = np.tanh(len(self.job_buffer) / Config.NORM_Q_LEN) 
-            # [CRITICAL FIX 2] Global Vision: Use active_jobs instead of job_buffer
+            # [修正 1] 感知對齊：統計 active_jobs (全系統) 而非 job_buffer
             if self.active_jobs:
                 avg_tard = np.tanh(np.mean([j.get_tardiness(self.now) for j in self.active_jobs]) / Config.NORM_TARDINESS)
                 avg_proc = np.tanh(np.mean([j.get_base_proc_time() for j in self.active_jobs]) / Config.NORM_PROC_TIME)
